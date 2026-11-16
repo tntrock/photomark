@@ -1,0 +1,13 @@
+[package]
+name = "photomark-core"
+description = "Crop- and rescale-resistant invisible image watermarking"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+image.workspace = true
+rayon.workspace = true
+rustfft = "6.2"
+sha2 = "0.10"
