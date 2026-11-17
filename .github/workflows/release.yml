@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Check the tag matches the version
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            Write-Error "tag ${{ github.ref_name }} does not match Cargo.toml version $version"
+            exit 1
+          }
+      - name: Build release
+        run: cargo build --release --workspace
+      - name: Assemble package
+        run: |
+          $name = "photomark-${{ github.ref_name }}-windows-x64"
+          New-Item -ItemType Directory -Force $name | Out-Null
+          Copy-Item target/release/photomark.exe, target/release/photomark-cli.exe, README.md, LICENSE, THIRD_PARTY_NOTICES.txt $name/
+          & "$name/photomark-cli.exe" fetch-models "$name/models"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "PHOTOMARK_MODELS=$PWD\$name\models" >> $env:GITHUB_ENV
+          "PACKAGE=$name" >> $env:GITHUB_ENV
+      - name: Neural layer round trip
+        run: |
+          cargo test --release -p photomark-core --test neural -- --nocapture 2>&1 | Tee-Object neural.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (Select-String -Path neural.log -Pattern "skipping" -Quiet) {
+            Write-Error "the neural test did not find the models"
+            exit 1
+          }
+      - name: Smoke test the packaged CLI
+        run: |
+          Remove-Item Env:PHOTOMARK_MODELS
+          Add-Type -AssemblyName System.Drawing
+          $bitmap = New-Object System.Drawing.Bitmap 960, 720
+          $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+          $rect = New-Object System.Drawing.Rectangle 0, 0, 960, 720
+          $brush = New-Object System.Drawing.Drawing2D.LinearGradientBrush $rect, ([System.Drawing.Color]::SteelBlue), ([System.Drawing.Color]::Orange), 35
+          $graphics.FillRectangle($brush, $rect)
+          $random = New-Object System.Random 7
+          for ($i = 0; $i -lt 300; $i++) {
+            $color = [System.Drawing.Color]::FromArgb($random.Next(256), $random.Next(256), $random.Next(256))
+            $graphics.FillEllipse((New-Object System.Drawing.SolidBrush $color), $random.Next(960), $random.Next(720), $random.Next(10, 90), $random.Next(10, 90))
+          }
+          $bitmap.Save("$PWD\sample.png", [System.Drawing.Imaging.ImageFormat]::Png)
+          $cli = "$env:PACKAGE/photomark-cli.exe"
+          $out = & $cli embed sample.png marked.png --id RELEASE
+          $out
+          if ($LASTEXITCODE -ne 0 -or -not ($out -match 'neural \+ tile layers')) { exit 1 }
+          $out = & $cli detect marked.png
+          $out
+          if ($LASTEXITCODE -ne 0 -or -not ($out -match 'RELEASE')) { exit 1 }
+      - name: Zip
+        run: |
+          Compress-Archive -Path $env:PACKAGE -DestinationPath "$env:PACKAGE.zip"
+          (Get-FileHash "$env:PACKAGE.zip" -Algorithm SHA256).Hash.ToLower() + "  $env:PACKAGE.zip" |
+            Out-File -Encoding ascii "$env:PACKAGE.zip.sha256"
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" "$env:PACKAGE.zip" "$env:PACKAGE.zip.sha256" `
+            --title "Photomark ${{ github.ref_name }}" --notes-file .github/release-notes.md
