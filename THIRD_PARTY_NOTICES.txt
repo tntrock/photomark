@@ -1,4 +1,5 @@
-Photomark includes third-party software and model files under the licenses below.
+Photomark itself is licensed under the GNU General Public License v3.0 (see LICENSE).
+It includes third-party software and model files under the licenses below.
 
 ================================================================================
 TrustMark models (models\encoder_Q.onnx, models\decoder_Q.onnx)

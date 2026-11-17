@@ -2,8 +2,10 @@
 name = "photomark-cli"
 description = "Command-line front end for photomark"
 version.workspace = true
+license.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 repository.workspace = true
 
 [dependencies]

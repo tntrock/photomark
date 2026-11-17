@@ -148,6 +148,12 @@ cargo test
 - 發布新版：更新 `Cargo.toml` 的 `version`，推送同名標籤（例如 `v0.1.0`），
   `.github/workflows/release.yml` 會建置、測試並建立 Release。
 
+## 授權
+
+Photomark 以 [GNU General Public License v3.0](LICENSE)（GPL-3.0-only）釋出：
+可以自由使用、修改與再發布，但發布修改後的版本時必須同樣以 GPL-3.0 公開原始碼。
+內含的第三方元件（TrustMark 模型、ONNX Runtime 等）沿用各自的授權，見 [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt)。
+
 ## 致謝
 
 神經網路層使用 Adobe Research 的 [TrustMark](https://github.com/adobe/trustmark)

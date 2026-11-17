@@ -2,8 +2,10 @@
 name = "photomark"
 description = "Windows app for invisible, crop-resistant photo watermarks"
 version.workspace = true
+license.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 repository.workspace = true
 
 [dependencies]
