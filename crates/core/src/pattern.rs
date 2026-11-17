@@ -31,6 +31,8 @@ pub(crate) enum Cell {
 #[derive(Clone)]
 pub struct WatermarkKey {
     pub(crate) cells: Vec<Cell>,
+    /// Whitening mask of the neural layer's bits.
+    pub(crate) neural_mask: u128,
 }
 
 impl WatermarkKey {
@@ -60,7 +62,9 @@ impl WatermarkKey {
                 Cell::Pilot(sign)
             };
         }
-        Self { cells }
+        let mut mask_rng = Rng::from_key(passphrase.as_bytes(), "neural-mask");
+        let neural_mask = (mask_rng.next_u64() as u128) << 64 | mask_rng.next_u64() as u128;
+        Self { cells, neural_mask }
     }
 
     /// Cell signs of the tile that carries `payload`.

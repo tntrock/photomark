@@ -2,14 +2,15 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 use std::thread;
 
 use eframe::egui::{self, Color32, RichText};
 use image::RgbaImage;
 use photomark_core::io::{self, OutputFormat};
 use photomark_core::{
-    detect, embed, payload_from_text, payload_to_text, DetectOptions, Detection, EmbedOptions,
-    WatermarkKey, PAYLOAD_BYTES,
+    detect_layers, embed_layers, models, payload_from_text, payload_to_text, DetectOptions,
+    EmbedOptions, LayeredDetection, NeuralEngine, WatermarkKey, PAYLOAD_BYTES,
 };
 
 /// Longest side of the preview texture shown on the detect tab.
@@ -79,7 +80,23 @@ enum EmbedMsg {
 
 enum DetectMsg {
     Preview(egui::ColorImage),
-    Finished(Result<Detection, String>),
+    Finished(Result<LayeredDetection, String>),
+}
+
+enum NeuralMsg {
+    /// Bytes of the model download fetched so far.
+    Downloaded(u64),
+    Finished(Result<Arc<NeuralEngine>, String>),
+}
+
+/// State of the neural (TrustMark) layer.
+enum Neural {
+    /// The model files are not installed.
+    Missing,
+    /// Loading, or downloading when a byte count is known.
+    Busy(Option<u64>),
+    Ready(Arc<NeuralEngine>),
+    Failed(String),
 }
 
 enum DetectSource {
@@ -91,6 +108,9 @@ struct App {
     zh: bool,
     tab: Tab,
     key: String,
+    neural: Neural,
+    neural_job: Option<Receiver<NeuralMsg>>,
+    use_neural: bool,
 
     files: Vec<PathBuf>,
     id: String,
@@ -106,16 +126,27 @@ struct App {
     detect_label: String,
     preview: Option<egui::TextureHandle>,
     detect_job: Option<Receiver<DetectMsg>>,
-    detect_result: Option<Result<Detection, String>>,
+    detect_result: Option<Result<LayeredDetection, String>>,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let zh = install_cjk_font(&cc.egui_ctx);
+        let mut app = Self::with_language(zh);
+        if models::find().is_some() {
+            app.start_neural(&cc.egui_ctx, false);
+        }
+        app
+    }
+
+    fn with_language(zh: bool) -> Self {
         Self {
             zh,
             tab: Tab::Embed,
             key: String::new(),
+            neural: Neural::Missing,
+            neural_job: None,
+            use_neural: true,
             files: Vec::new(),
             id: String::new(),
             strength: 1.0,
@@ -161,10 +192,54 @@ impl App {
         }
     }
 
+    /// Load the neural models in the background, downloading them first if asked.
+    fn start_neural(&mut self, ctx: &egui::Context, download: bool) {
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        let zh = self.zh;
+        self.neural = Neural::Busy(download.then_some(0));
+        self.neural_job = Some(rx);
+
+        thread::spawn(move || {
+            let result = (|| -> Result<Arc<NeuralEngine>, String> {
+                if download {
+                    let dir = models::user_dir().ok_or("LOCALAPPDATA is not set")?;
+                    models::fetch(&dir, |done| {
+                        let _ = tx.send(NeuralMsg::Downloaded(done));
+                        ctx.request_repaint();
+                    })
+                    .map_err(|e| e.to_string())?;
+                    if !models::is_complete(&dir) {
+                        let (file, dir) = (models::RUNTIME_FILE, dir.display());
+                        return Err(if zh {
+                            format!("模型已下載，但此版本還需要把 {file} 放進 {dir}")
+                        } else {
+                            format!("Models downloaded, but this build also needs {file} in {dir}")
+                        });
+                    }
+                }
+                let dir = models::find().ok_or("models not found")?;
+                let engine = NeuralEngine::load(&dir).map_err(|e| e.to_string())?;
+                Ok(Arc::new(engine))
+            })();
+            let _ = tx.send(NeuralMsg::Finished(result));
+            ctx.request_repaint();
+        });
+    }
+
+    /// The engine to use for the next job, if the neural layer is ready and wanted.
+    fn engine(&self) -> Option<Arc<NeuralEngine>> {
+        match &self.neural {
+            Neural::Ready(engine) if self.use_neural => Some(engine.clone()),
+            _ => None,
+        }
+    }
+
     fn start_embed(&mut self, ctx: &egui::Context) {
         let Some(payload) = payload_from_text(&self.id) else {
             return;
         };
+        let engine = self.engine();
         let files = self.files.clone();
         let key = WatermarkKey::new(&self.key);
         let options = EmbedOptions {
@@ -189,13 +264,23 @@ impl App {
                     &key,
                     &payload,
                     &options,
+                    engine.as_deref(),
                     format,
                     quality,
                     out_dir.as_deref(),
                 );
                 let line = match result {
-                    Ok((output, psnr)) => {
-                        format!("[OK] {name} → {} (PSNR {psnr:.1} dB)", output.display())
+                    Ok((output, psnr, neural)) => {
+                        let layers = match (neural, zh) {
+                            (true, true) => "神經網路＋圖樣",
+                            (false, true) => "僅圖樣",
+                            (true, false) => "neural + tile",
+                            (false, false) => "tile only",
+                        };
+                        format!(
+                            "[OK] {name} → {} ({layers}, PSNR {psnr:.1} dB)",
+                            output.display()
+                        )
                     }
                     Err(e) if zh => format!("[失敗] {name}：{e}"),
                     Err(e) => format!("[FAILED] {name}: {e}"),
@@ -212,6 +297,7 @@ impl App {
 
     fn start_detect(&mut self, ctx: &egui::Context, source: DetectSource, label: String) {
         let key = WatermarkKey::new(&self.key);
+        let engine = self.engine();
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
 
@@ -234,8 +320,9 @@ impl App {
             };
             let _ = tx.send(DetectMsg::Preview(preview_image(&pixels)));
             ctx.request_repaint();
-            let found = detect(&pixels, &key, &DetectOptions::default());
-            let _ = tx.send(DetectMsg::Finished(Ok(found)));
+            let found = detect_layers(&pixels, &key, &DetectOptions::default(), engine.as_deref())
+                .map_err(|e| e.to_string());
+            let _ = tx.send(DetectMsg::Finished(found));
             ctx.request_repaint();
         });
     }
@@ -263,6 +350,24 @@ impl App {
     }
 
     fn poll_jobs(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.neural_job {
+            let mut finished = false;
+            for msg in rx.try_iter() {
+                match msg {
+                    NeuralMsg::Downloaded(bytes) => self.neural = Neural::Busy(Some(bytes)),
+                    NeuralMsg::Finished(result) => {
+                        self.neural = match result {
+                            Ok(engine) => Neural::Ready(engine),
+                            Err(message) => Neural::Failed(message),
+                        };
+                        finished = true;
+                    }
+                }
+            }
+            if finished {
+                self.neural_job = None;
+            }
+        }
         if let Some(rx) = &self.embed_job {
             let mut finished = false;
             for msg in rx.try_iter() {
@@ -350,6 +455,54 @@ impl App {
                 "檢測時必須使用與嵌入時相同的金鑰",
                 "Detection needs the same key used for embedding",
             ));
+        });
+    }
+
+    /// Status of the neural layer, with the controls to install or switch it.
+    fn neural_row(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let megabytes = models::DOWNLOAD_BYTES / 1_000_000;
+        ui.horizontal(|ui| {
+            ui.label(self.t("神經網路層 (TrustMark)", "Neural layer (TrustMark)"));
+            let mut download = false;
+            match &self.neural {
+                Neural::Ready(_) => {
+                    let label = self.t("啟用", "Enabled");
+                    ui.checkbox(&mut self.use_neural, label);
+                    ui.weak(self.t(
+                        "耐強壓縮、縮圖與濾鏡；裁切則靠圖樣層",
+                        "Survives heavy compression, shrinking and filters; the tile layer covers crops",
+                    ));
+                }
+                Neural::Busy(None) => {
+                    ui.spinner();
+                    ui.label(self.t("載入模型中…", "Loading models…"));
+                }
+                Neural::Busy(Some(bytes)) => {
+                    let fraction = *bytes as f32 / models::DOWNLOAD_BYTES as f32;
+                    ui.add(
+                        egui::ProgressBar::new(fraction)
+                            .desired_width(220.0)
+                            .text(format!("{} / {megabytes} MB", bytes / 1_000_000)),
+                    );
+                }
+                Neural::Missing => {
+                    ui.weak(self.t("尚未安裝模型", "Models not installed"));
+                    let label = if self.zh {
+                        format!("下載模型（{megabytes} MB）")
+                    } else {
+                        format!("Download models ({megabytes} MB)")
+                    };
+                    download = ui.button(label).clicked();
+                }
+                Neural::Failed(message) => {
+                    ui.colored_label(RED, message);
+                    download = ui.button(self.t("重試", "Retry")).clicked();
+                }
+            }
+            if download {
+                self.start_neural(&ctx, models::find().is_none());
+            }
         });
     }
 
@@ -554,24 +707,49 @@ impl App {
                         ));
                     }
                 }
-                let turned = match (found.quarter_turns, found.mirrored) {
-                    (0, false) => String::new(),
-                    (turns, false) if self.zh => format!("，旋轉 {}°", turns as u32 * 90),
-                    (turns, true) if self.zh => format!("，旋轉 {}° 並鏡射", turns as u32 * 90),
-                    (turns, false) => format!(", rotated {}°", turns as u32 * 90),
-                    (turns, true) => format!(", rotated {}° and mirrored", turns as u32 * 90),
-                };
-                ui.weak(if self.zh {
-                    format!(
-                        "信心分數 {:.1}，圖樣週期 {:.1} px{turned}",
-                        found.score, found.tile_period
-                    )
+                if let Some(neural) = &found.neural {
+                    let turns = neural.quarter_turns as u32 * 90;
+                    ui.weak(if self.zh {
+                        format!(
+                            "神經網路層：已偵測（修正 {} bits，旋轉 {turns}°）",
+                            neural.corrected
+                        )
+                    } else {
+                        format!(
+                            "Neural layer: found ({} bits corrected, rotated {turns}°)",
+                            neural.corrected
+                        )
+                    });
+                }
+                let tile = &found.tile;
+                if tile.detected {
+                    let turned = match (tile.quarter_turns, tile.mirrored) {
+                        (0, false) => String::new(),
+                        (turns, false) if self.zh => format!("，旋轉 {}°", turns as u32 * 90),
+                        (turns, true) if self.zh => {
+                            format!("，旋轉 {}° 並鏡射", turns as u32 * 90)
+                        }
+                        (turns, false) => format!(", rotated {}°", turns as u32 * 90),
+                        (turns, true) => format!(", rotated {}° and mirrored", turns as u32 * 90),
+                    };
+                    ui.weak(if self.zh {
+                        format!(
+                            "圖樣層：已偵測（信心分數 {:.1}，圖樣週期 {:.1} px{turned}）",
+                            tile.score, tile.tile_period
+                        )
+                    } else {
+                        format!(
+                            "Tile layer: found (score {:.1}, tile period {:.1} px{turned})",
+                            tile.score, tile.tile_period
+                        )
+                    });
                 } else {
-                    format!(
-                        "score {:.1}, tile period {:.1} px{turned}",
-                        found.score, found.tile_period
-                    )
-                });
+                    ui.weak(if self.zh {
+                        format!("圖樣層：未偵測（最高分數 {:.1}）", tile.score)
+                    } else {
+                        format!("Tile layer: not found (best score {:.1})", tile.score)
+                    });
+                }
             }
             Some(Ok(found)) => {
                 ui.label(
@@ -582,12 +760,12 @@ impl App {
                 ui.weak(if self.zh {
                     format!(
                         "最高分數 {:.1}。若確定有浮水印，請確認金鑰是否正確。",
-                        found.score
+                        found.tile.score
                     )
                 } else {
                     format!(
                         "best score {:.1}. Check that the key is right.",
-                        found.score
+                        found.tile.score
                     )
                 });
             }
@@ -623,6 +801,7 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.tab, Tab::Embed, embed);
                 ui.selectable_value(&mut self.tab, Tab::Detect, detect);
             });
+            self.neural_row(ui);
             ui.add_space(4.0);
         });
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
@@ -656,18 +835,22 @@ fn preview_image(pixels: &RgbaImage) -> egui::ColorImage {
     )
 }
 
-/// Watermark one file and return where it was written and the PSNR against the original.
+/// Watermark one file and return where it was written, the PSNR against the original
+/// and whether the neural layer was added.
+#[allow(clippy::too_many_arguments)]
 fn embed_file(
     input: &Path,
     key: &WatermarkKey,
     payload: &[u8; PAYLOAD_BYTES],
     options: &EmbedOptions,
+    engine: Option<&NeuralEngine>,
     format: FormatChoice,
     quality: u8,
     out_dir: Option<&Path>,
-) -> Result<(PathBuf, f32), String> {
+) -> Result<(PathBuf, f32, bool), String> {
     let mut loaded = io::load(input).map_err(|e| e.to_string())?;
-    let report = embed(&mut loaded.pixels, key, payload, options);
+    let report = embed_layers(&mut loaded.pixels, key, payload, options, engine)
+        .map_err(|e| e.to_string())?;
 
     let is_jpeg = input
         .extension()
@@ -686,7 +869,7 @@ fn embed_file(
         loaded.icc_profile.as_deref(),
     )
     .map_err(|e| e.to_string())?;
-    Ok((output, report.psnr))
+    Ok((output, report.psnr, report.neural))
 }
 
 /// `<stem>_wm.<ext>` in `out_dir` (or next to the input), numbered if that name is taken,
