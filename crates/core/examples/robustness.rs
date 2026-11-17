@@ -1,5 +1,7 @@
 //! Embed a watermark into a photo, attack it in various ways and report what survives.
 //!
+//! The neural layer is included when its models are installed (see `photomark-cli fetch-models`).
+//!
 //! ```text
 //! cargo run --release -p photomark-core --example robustness -- photo.jpg [strength]
 //! ```
@@ -12,7 +14,8 @@ use image::codecs::jpeg::JpegEncoder;
 use image::imageops::{self, FilterType};
 use image::{DynamicImage, Rgba, RgbaImage};
 use photomark_core::{
-    detect, embed, io, payload_to_text, DetectOptions, EmbedOptions, WatermarkKey,
+    detect_layers, embed_layers, io, models, payload_to_text, DetectOptions, EmbedOptions,
+    NeuralEngine, WatermarkKey,
 };
 
 const ID: &[u8; 8] = b"TEST-ID1";
@@ -70,6 +73,12 @@ fn main() {
     let path = args.next().expect("usage: robustness <photo> [strength]");
     let strength: f32 = args.next().map_or(1.0, |s| s.parse().unwrap());
 
+    let engine = models::find().map(|dir| NeuralEngine::load(&dir).unwrap());
+    let engine = engine.as_ref();
+    if engine.is_none() {
+        println!("neural models not installed: testing the tile layer only");
+    }
+
     let original = io::load(Path::new(&path)).unwrap().pixels;
     let key = WatermarkKey::new("robustness");
     let mut marked = original.clone();
@@ -77,7 +86,7 @@ fn main() {
         strength,
         cell: None,
     };
-    let report = embed(&mut marked, &key, ID, &options);
+    let report = embed_layers(&mut marked, &key, ID, &options, engine).unwrap();
     println!(
         "{path}: {}x{}, cell {} px, PSNR {:.1} dB",
         marked.width(),
@@ -90,6 +99,7 @@ fn main() {
         ("untouched", marked.clone()),
         ("jpeg q85", jpeg(&marked, 85)),
         ("jpeg q60", jpeg(&marked, 60)),
+        ("jpeg q15", jpeg(&marked, 15)),
         ("crop to 25%", crop(&marked, 0.25)),
         ("crop to 10%", crop(&marked, 0.10)),
         ("crop to 5%", crop(&marked, 0.05)),
@@ -97,6 +107,15 @@ fn main() {
         ("scale 0.5", scale(&marked, 0.5)),
         ("scale 0.73", scale(&marked, 0.73)),
         ("scale 1.37", scale(&marked, 1.37)),
+        ("scale 0.12 + jpeg q50", jpeg(&scale(&marked, 0.12), 50)),
+        ("blur sigma 3", imageops::blur(&marked, 3.0)),
+        (
+            "brighten + contrast + jpeg q70",
+            jpeg(
+                &imageops::contrast(&imageops::brighten(&marked, 25), 25.0),
+                70,
+            ),
+        ),
         ("crop 25% + jpeg q75", jpeg(&crop(&marked, 0.25), 75)),
         (
             "crop 20% + scale 0.6 + jpeg q75",
@@ -122,17 +141,22 @@ fn main() {
     let mut passed = 0;
     for (name, img) in &cases {
         let start = Instant::now();
-        let found = detect(img, &key, &detect_options);
+        let found = detect_layers(img, &key, &detect_options, engine).unwrap();
         let ok = found.detected && found.payload.as_ref() == Some(ID);
         passed += ok as usize;
         println!(
-            "  {:<40} {:>4}x{:<4} {}  score {:>6.1}  period {:>6.1}  id {:<10} {:.1}s",
+            "  {:<40} {:>4}x{:<4} {}  tile {:<4} (score {:>5.1})  neural {:<4}  id {:<10} {:.1}s",
             name,
             img.width(),
             img.height(),
             if ok { "PASS" } else { "FAIL" },
-            found.score,
-            found.tile_period,
+            if found.tile.payload.is_some() {
+                "ok"
+            } else {
+                "-"
+            },
+            found.tile.score,
+            if found.neural.is_some() { "ok" } else { "-" },
             found.payload.as_ref().map_or("-".into(), payload_to_text),
             start.elapsed().as_secs_f32()
         );
@@ -143,7 +167,7 @@ fn main() {
         ("unmarked original", &original, &key),
         ("marked, wrong key", &marked, &WatermarkKey::new("wrong")),
     ] {
-        let found = detect(img, key, &detect_options);
+        let found = detect_layers(img, key, &detect_options, engine).unwrap();
         println!(
             "  {:<40} {}  score {:.1}",
             name,
@@ -152,7 +176,7 @@ fn main() {
             } else {
                 "clean"
             },
-            found.score
+            found.tile.score
         );
     }
 }

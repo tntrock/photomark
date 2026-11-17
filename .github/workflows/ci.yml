@@ -25,14 +25,27 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Test
-        run: cargo test --workspace
       - name: Build release
         run: cargo build --release --workspace
+      - name: Download neural models
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/photomark.exe, target/release/photomark-cli.exe dist/
+          dist/photomark-cli.exe fetch-models dist/models
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "PHOTOMARK_MODELS=$PWD\dist\models" >> $env:GITHUB_ENV
+      - name: Test
+        run: cargo test --workspace
+      - name: Neural layer round trip
+        run: |
+          cargo test -p photomark-core --test neural -- --nocapture 2>&1 | Tee-Object neural.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (Select-String -Path neural.log -Pattern "skipping" -Quiet) {
+            Write-Error "the neural test did not find the models"
+            exit 1
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: photomark-windows-x64
-          path: |
-            target/release/photomark.exe
-            target/release/photomark-cli.exe
+          path: dist/
           if-no-files-found: error

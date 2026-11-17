@@ -11,3 +11,13 @@ image.workspace = true
 rayon.workspace = true
 rustfft = "6.2"
 sha2 = "0.10"
+ndarray = "0.16"
+ureq = "2.12"
+
+# ONNX Runtime ships prebuilt static libraries for MSVC only; other toolchains load
+# onnxruntime.dll at run time from the models folder.
+[target.'cfg(target_env = "msvc")'.dependencies]
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "ndarray", "download-binaries"] }
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "ndarray", "load-dynamic"] }
