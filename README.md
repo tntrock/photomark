@@ -66,13 +66,20 @@ cargo run --release -p photomark-core --example robustness -- 你的照片.jpg
 
 ## 使用方式
 
+### 下載
+
+到 [Releases](https://github.com/tntrock/photomark/releases/latest) 下載 `photomark-…-windows-x64.zip`，
+解壓後執行 `photomark.exe` 即可，不需要安裝。壓縮檔已附模型（`models` 資料夾），神經網路層直接可用。
+
+執行檔沒有數位簽章，第一次開啟時 SmartScreen 可能出現警告，按「其他資訊」→「仍要執行」。
+
 ### 安裝神經網路模型
 
 模型檔（`encoder_Q.onnx`、`decoder_Q.onnx`，共約 65 MB）不在原始碼庫內，取得方式擇一：
 
 - 圖形介面上方按「下載模型」，或執行 `photomark-cli fetch-models`。
   會從 Adobe 的模型主機下載到 `%LOCALAPPDATA%\photomark\models`，並以 SHA-256 驗證。
-- 使用 CI 產出的壓縮檔：執行檔旁已附 `models` 資料夾，解壓後即可使用。
+- 使用 Release 的壓縮檔：執行檔旁已附 `models` 資料夾。
 
 程式依序在這些位置尋找模型：環境變數 `PHOTOMARK_MODELS` 指定的資料夾、執行檔旁的 `models`、
 `%LOCALAPPDATA%\photomark\models`。
@@ -138,6 +145,8 @@ cargo test
   需自行把 [ONNX Runtime 1.22](https://github.com/microsoft/onnxruntime/releases/tag/v1.22.0)
   的 `onnxruntime.dll` 放進模型資料夾。
 - 神經網路層的測試（`crates/core/tests/neural.rs`）在找不到模型時會自動略過。
+- 發布新版：更新 `Cargo.toml` 的 `version`，推送同名標籤（例如 `v0.1.0`），
+  `.github/workflows/release.yml` 會建置、測試並建立 Release。
 
 ## 致謝
 
